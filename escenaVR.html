@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vídeo + Splat con entrada/salida de partículas</title>
+  <link rel="manifest" href="manifest-vr.webmanifest" />
+  <meta name="theme-color" content="#000000" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.9/shaka-player.compiled.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    canvas { display: block; touch-action: none; outline: none; }
+    #hud {
+      position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 12px; align-items: center;
+      padding: 12px 16px; background: linear-gradient(transparent, rgba(0,0,0,.65));
+      font: 13px system-ui, sans-serif; color: #fff;
+    }
+    #hud button {
+      background: rgba(255,255,255,.12); color: #fff; border: 1px solid rgba(255,255,255,.25);
+      border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer;
+    }
+    #hud button:hover { background: rgba(202,254,254,.25); }
+    #seek { flex: 1; accent-color: #cafefe; }
+    #seek:disabled { opacity: .35; }
+    #time { min-width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+    #vrBtn {
+      position: fixed; right: 16px; bottom: 76px; z-index: 10000; padding: 12px 18px; border-radius: 10px;
+      border: 1px solid #cafefe; background: rgba(0,0,0,.75); color: #cafefe; font: 600 14px system-ui, sans-serif;
+      cursor: pointer; touch-action: manipulation; pointer-events: auto;
+    }
+    #vrBtn:disabled { opacity: .5; cursor: not-allowed; }
+    #btnTop, #btnSplat { display: none; }
+    #btnSplat { background: #cafefe !important; color: #000 !important; font-weight: 600; }
+    #btnContinue { display: none; background: #cafefe !important; color: #000 !important; font-weight: 600; }
+    #status {
+      position: fixed; top: 12px; left: 12px; padding: 6px 10px; border-radius: 6px;
+      background: rgba(0,0,0,.45); color: #cafefe; font: 12px/1.5 monospace; white-space: pre; pointer-events: none;
+    }
+    #start {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.6); color: #fff; font: 600 22px system-ui, sans-serif; cursor: pointer; z-index: 10;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/",
+        "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.2.0/dist/spark.module.js",
+        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm"
+      }
+    }
+  </script>
+
+  <canvas id="canvas" tabindex="0"></canvas>
+  <pre id="status"></pre>
+  <div id="start"> Pulsa para empezar</div>
+  <div id="hud">
+    <button id="btnPlay">⏯</button>
+    <input id="seek" type="range" min="0" max="1000" value="0" />
+    <span id="time">0:00 / 0:00</span>
+    <button id="btnSplat">✦ Mostrar splat</button>
+    <button id="btnTop">Vista cenital (T)</button>
+    <button id="btnContinue">Continuar vídeo ▸</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { SparkRenderer, SplatMesh, dyno } from "@sparkjsdev/spark";
+    import GUI from "lil-gui";
+    import { HTMLMesh } from "three/addons/interactive/HTMLMesh.js";
+    import { InteractiveGroup } from "three/addons/interactive/InteractiveGroup.js";
+
+    // ===================================================================
+    // CONFIGURACIÓN
+    // ===================================================================
+    const VIDEO_URL = "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd"; // .mpd/.m3u8 -> Shaka; otro -> <video src>
+    const MAX_VIDEO_HEIGHT = 1080;
+    const PRELOAD_LEAD = 5;      // s de vídeo antes del cue en los que ya se descarga/decodifica el splat
+    // --- VR ---
+    // Locomoción: stick izquierdo = moverse (hacia donde miras), stick derecho = giro
+    const LOCOMOTION = { enabled: true, speed: 2.0, snapTurn: true, snapAngleDeg: 30, deadZone: 0.15 };
+    // Vuelo libre (solo mientras el splat está en escena): se avanza hacia donde mira la cámara, con inclinación incluida.
+    //  VR: stick izq = mover (hacia donde miras), stick der X = giro, stick der Y = subir/bajar, clic del stick izq = turbo
+    //  PC: WASD = mover, E/Q (o R/F) = subir/bajar, Shift = turbo, arrastrar = mirar, rueda = velocidad, T = vista cenital
+    const FLY = {
+      relSpeed: 0.6,   // velocidad base en radios de objeto por segundo (se adapta al tamaño del splat)
+      minSpeed: 1.0,   // m/s mínimos
+      maxSpeed: 80,    // m/s máximos
+      boost: 3,        // multiplicador del turbo
+      smooth: 8,       // inercia (más alto = respuesta más seca)
+      lookSens: 0.0025 // sensibilidad del ratón/táctil
+    };
+    // Vista cenital: posición de la cámara al aparecer el splat (× radio del objeto)
+    const TOP_VIEW = { above: 0.6, back: 0.9 };
+    const VR_SCREEN = { height: 4.5, distance: 6, y: 2.4 };   // pantalla de cine fija (m)
+    const VR_OBJECT = { radius: 4, distance: 14, y: 3 };        // tamaño y posición del splat en el mundo VR (m); ahora es explorable volando
+    const VR_LOD_SCALE = 0.5;                                  // menos splats en el visor (mejor rendimiento)
+    const LOADING_VIDEO_CAP = 360; // tope de calidad del vídeo mientras se precarga el splat (deja ancho de banda al splat)
+
+    // Cada cue pausa el vídeo en `time` y muestra un splat con animación de entrada/salida.
+    //  - hold: segundos que se queda el splat formado (0 = espera al botón "Continuar")
+    //  - flip: true para splats con orientación PLY habitual (quaternion 1,0,0,0)
+    //  - paged: true para .rad con LoD en streaming; lod: true/"quality" para construir LoD al vuelo
+    //    con .spz/.ply grandes (coste de CPU al cargar). Para objetos pequeños déjalos en false.
+    //  - keep: true = no libera el splat tras la salida (repetir sin recargar; gasta memoria)
+    const CUES = [
+      {
+        time: 8,
+        url: "https://storage.googleapis.com/forge-dev-public/asundqui/coit/coit-40m-sh1-lod.rad",
+        hold: 0, flip: true, paged: true, lod: false, keep: false,
+        position: [0, 0, 0], scale: 1,
+      },
+      // Ejemplo con RAD/LoD en streaming:
+      // { time: 30, url: "https://.../objeto-lod.rad", hold: 6, flip: true, paged: true, position: [0,0,0], scale: 1, frameDist: 6 },
+    ];
+
+    // Parámetros del efecto (todo lo espacial va como fracción del tamaño del objeto)
+    const params = {
+      introSec: 3.2,
+      outroSec: 2.2,
+      spread: 1.8,      // radio de la nube de puntos inicial (× radio del objeto)
+      swirl: 6.0,       // giro en espiral mientras se agrupan (rad)
+      stagger: 0.55,    // 0 = todos a la vez, 0.9 = muy escalonado
+      waveMix: 0.5,     // 0 = orden aleatorio, 1 = de abajo hacia arriba
+      dotSize: 0.012,   // tamaño de cada puntito (× radio del objeto)
+      tintAmount: 0.85, // cuánto se tiñen los puntos mientras vuelan
+      tint: "#cafefe",
+      videoDim: 0.28,   // brillo del vídeo mientras se muestra el splat
+    };
+
+    // ===================================================================
+    // RENDERER / ESCENA
+    // ===================================================================
+    const canvas = document.getElementById("canvas");
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType("local-floor");
+
+    // ---------------------------------------------------------------
+    // Botón "Entrar en VR" propio (sustituye a VRButton): siempre por encima de todo y con mensajes de error visibles.
+    // ---------------------------------------------------------------
+    const XR_INIT = { optionalFeatures: ["local-floor", "bounded-floor", "layers"] };
+    const vrBtn = document.createElement("button");
+    vrBtn.id = "vrBtn";
+    vrBtn.textContent = "Comprobando VR…";
+    vrBtn.disabled = true;
+    document.body.appendChild(vrBtn);
+
+    let xrSupported = false, enteringVR = false;
+    async function enterVR() {
+      if (!("xr" in navigator) || renderer.xr.isPresenting || enteringVR) return false;
+      enteringVR = true;
+      try {
+        // requestSession debe llamarse dentro del gesto del usuario (clic / pulsar el icono de la PWA)
+        const session = await navigator.xr.requestSession("immersive-vr", XR_INIT);
+        await renderer.xr.setSession(session);
+        return true;
+      } catch (e) {
+        console.warn("No se pudo entrar en VR:", e);
+        vrBtn.textContent = "No se pudo entrar en VR: " + (e.message || e.name);
+        setTimeout(() => { vrBtn.textContent = "ENTRAR EN VR"; }, 5000);
+        return false;
+      } finally { enteringVR = false; }
+    }
+    vrBtn.addEventListener("click", enterVR);
+    renderer.xr.addEventListener("sessionstart", () => { vrBtn.style.display = "none"; });
+    renderer.xr.addEventListener("sessionend", () => { vrBtn.style.display = ""; });
+
+    const xrChecked = (async () => {
+      if (!("xr" in navigator)) { vrBtn.textContent = "VR no disponible (WebXR no soportado / requiere HTTPS)"; return; }
+      try { xrSupported = await navigator.xr.isSessionSupported("immersive-vr"); } catch { }
+      vrBtn.disabled = !xrSupported;
+      vrBtn.textContent = xrSupported ? "ENTRAR EN VR" : "VR no disponible en este dispositivo";
+    })();
+
+    // ¿Corre como PWA instalada (icono en la biblioteca de Quest / app instalada)?
+    const isInstalledPWA =
+      matchMedia("(display-mode: standalone)").matches ||
+      navigator.standalone === true ||
+      window.getDigitalGoodsService !== undefined; // Meta Quest: solo existe dentro del ámbito de una PWA
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 1000);
+    camera.position.set(0, 0.5, 3.5);
+    // Rig de usuario: moverse en VR = trasladar el rig (la pose de la cabeza se suma encima)
+    const userRig = new THREE.Group();
+    userRig.add(camera); // el fondo de vídeo (modo 2D) cuelga de la cámara
+    scene.add(userRig);
+
+    const spark = new SparkRenderer({
+      renderer,
+      maxStdDev: Math.sqrt(8),
+      pagedExtSplats: CUES.some((c) => c.paged),
+    });
+    scene.add(spark);
+
+    // Vuelo libre en escritorio (el de VR está en updateVRLocomotion). Solo actúa mientras hay splat (cueBusy()).
+    const fly = { yaw: 0, pitch: 0, keys: new Set(), vel: new THREE.Vector3(), mult: 1, dragging: false, lx: 0, ly: 0 };
+    camera.rotation.order = "YXZ";
+    function setLook(yaw, pitch) {
+      fly.yaw = yaw;
+      fly.pitch = THREE.MathUtils.clamp(pitch, -1.55, 1.55);
+      camera.rotation.set(fly.pitch, fly.yaw, 0, "YXZ");
+    }
+    canvas.addEventListener("pointerdown", (e) => {
+      if (renderer.xr.isPresenting || !cueBusy()) return;
+      fly.dragging = true; fly.lx = e.clientX; fly.ly = e.clientY;
+      canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener("pointermove", (e) => {
+      if (!fly.dragging || renderer.xr.isPresenting) return;
+      setLook(fly.yaw - (e.clientX - fly.lx) * FLY.lookSens, fly.pitch - (e.clientY - fly.ly) * FLY.lookSens);
+      fly.lx = e.clientX; fly.ly = e.clientY;
+    });
+    const endDrag = () => { fly.dragging = false; };
+    canvas.addEventListener("pointerup", endDrag);
+    canvas.addEventListener("pointercancel", endDrag);
+    canvas.addEventListener("wheel", (e) => {
+      if (!cueBusy()) return;
+      e.preventDefault();
+      fly.mult = THREE.MathUtils.clamp(fly.mult * Math.exp(-e.deltaY * 0.001), 0.1, 10);
+    }, { passive: false });
+    addEventListener("keyup", (e) => fly.keys.delete(e.code));
+    addEventListener("blur", () => fly.keys.clear());
+
+    // ===================================================================
+    // VÍDEO (Shaka) + fondo pantalla completa
+    // ===================================================================
+    const video = document.createElement("video");
+    video.crossOrigin = "anonymous";
+    video.playsInline = true;
+    video.muted = true;
+    video.preload = "auto";
+
+    let player = null;
+    async function initVideo() {
+      if (/\.(mpd|m3u8)(\?|$)/i.test(VIDEO_URL) && window.shaka) {
+        shaka.polyfill.installAll();
+        if (shaka.Player.isBrowserSupported()) {
+          player = new shaka.Player();
+          await player.attach(video);
+          player.configure({
+            abr: {
+              enabled: true,
+              restrictions: { maxHeight: MAX_VIDEO_HEIGHT, maxWidth: Math.round(MAX_VIDEO_HEIGHT * 16 / 9) },
+              defaultBandwidthEstimate: 3_000_000,
+              switchInterval: 4,
+              bandwidthUpgradeTarget: 0.8,
+              bandwidthDowngradeTarget: 0.95,
+            },
+            streaming: { bufferingGoal: 20, rebufferingGoal: 3, bufferBehind: 10 },
+          });
+          await player.load(VIDEO_URL);
+          return;
+        }
+      }
+      video.src = VIDEO_URL;
+    }
+    function setVideoCap(h) {
+      if (!player) return;
+      player.configure({ abr: { restrictions: { maxHeight: h, maxWidth: Math.round(h * 16 / 9) } } });
+    }
+
+    const videoTex = new THREE.VideoTexture(video);
+    videoTex.colorSpace = THREE.SRGBColorSpace;
+    const videoMat = new THREE.MeshBasicMaterial({ map: videoTex, toneMapped: false, depthTest: false, depthWrite: false });
+    const videoPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), videoMat);
+    videoPlane.renderOrder = -100;
+    videoPlane.frustumCulled = false;
+    const VIDEO_DIST = 60;
+    videoPlane.position.z = -VIDEO_DIST;
+    camera.add(videoPlane);
+
+    function fitVideoPlane() {
+      if (renderer.xr.isPresenting) { // en VR el vídeo es una pantalla fija en el mundo
+        const arVR = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
+        videoPlane.scale.set(VR_SCREEN.height * arVR, VR_SCREEN.height, 1);
+        return;
+      }
+      const H = 2 * VIDEO_DIST * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+      const W = H * camera.aspect;
+      const ar = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
+      let h = H, w = H * ar;                 // "contain": el vídeo entero, con barras si hace falta
+      if (w > W) { w = W; h = W / ar; }
+      videoPlane.scale.set(w, h, 1);
+    }
+    fitVideoPlane();
+    video.addEventListener("loadedmetadata", fitVideoPlane);
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      fitVideoPlane();
+    });
+
+    // ===================================================================
+    // EFECTO DYNO: puntitos -> splat (entrada) y splat -> puntitos (salida)
+    // ===================================================================
+    const uP = dyno.dynoFloat(0);
+    const uDir = dyno.dynoFloat(1);
+    const uOrigin = dyno.dynoVec3(new THREE.Vector3());                   // centro del objeto (espacio objeto)
+    const uShape = dyno.dynoVec4(new THREE.Vector4(1.5, 0, 1, 1));         // radio nube, minUp, altura, signo "arriba"
+    const uMotion = dyno.dynoVec4(new THREE.Vector4(6, 0.55, 0.5, 0.012)); // giro, escalonado, waveMix, tamaño punto
+    const uTint = dyno.dynoVec4(new THREE.Vector4(0.79, 1, 1, 0.85));      // rgb + cantidad
+
+    // <<FX_GLOBALS
+    const FX_GLOBALS = `
+      uint fxIH(uint x) {
+        x ^= x >> 16u; x *= 0x7feb352du;
+        x ^= x >> 15u; x *= 0x846ca68bu;
+        x ^= x >> 16u; return x;
+      }
+      float fxU(uint h) { return float(h >> 8u) * (1.0 / 16777216.0); }
+      vec4 fxRand(vec3 p, uint salt) {
+        uvec3 q = floatBitsToUint(p);
+        uint s = fxIH(q.x ^ fxIH(q.y ^ fxIH(q.z ^ (0x9e3779b9u + salt * 0x85ebca6bu))));
+        return vec4(fxU(fxIH(s)), fxU(fxIH(s + 1u)), fxU(fxIH(s + 2u)), fxU(fxIH(s + 3u)));
+      }
+      mat2 fxRot(float a) { float s = sin(a), c = cos(a); return mat2(c, -s, s, c); }
+    `;
+    // FX_GLOBALS>>
+
+    // <<FX_STATEMENTS
+    const fxStatements = ({ inputs, outputs }) => `
+      ${outputs.gsplat} = ${inputs.gsplat};
+      float fxP = ${inputs.p};
+      if (fxP < 0.9999) {
+        vec3  fxC     = ${inputs.gsplat}.center;
+        vec4  fxR     = fxRand(fxC, 0u);
+        vec4  fxQ     = fxRand(fxC, 1u);
+        float fxDir   = ${inputs.dir};
+        float fxRad   = ${inputs.shape}.x;
+        float fxUp    = ${inputs.shape}.w;
+        float fxHgt   = max(${inputs.shape}.z, 1e-4);
+        float fxSwirl = ${inputs.motion}.x;
+        float fxStag  = clamp(${inputs.motion}.y, 0.0, 0.9);
+        float fxWaveMix = ${inputs.motion}.z;
+        float fxDot   = ${inputs.motion}.w;
+
+        // Retardo por splat: mezcla de azar y altura (onda de abajo a arriba)
+        float fxWave = clamp((fxC.y * fxUp - ${inputs.shape}.y) / fxHgt, 0.0, 1.0);
+        float fxD = mix(fxR.x, fxWave, fxWaveMix) * fxStag;
+        if (fxDir < 0.0) fxD = fxStag - fxD;
+        float fxLt = clamp((fxP - fxD) / (1.0 - fxStag), 0.0, 1.0);
+        float fxE = 1.0 - pow(1.0 - fxLt, 3.0); // ease-out: llegan rápido y se asientan
+
+        // Posición dispersa: nube esférica alrededor del origen
+        vec3  fxO  = ${inputs.origin};
+        vec3  fxDv = normalize(fxQ.xyz * 2.0 - 1.0 + vec3(1e-4));
+        float fxRr = fxRad * (0.35 + 0.65 * sqrt(fxQ.w));
+        vec3  fxScat = fxO + fxDv * fxRr;
+        if (fxDir < 0.0) fxScat.y += fxUp * 0.5 * fxRad * fxR.y; // en la salida el polvo sube
+
+        vec3 fxPos = mix(fxScat, fxC, fxE);
+        fxPos.y += fxUp * sin(fxE * 3.14159265) * 0.15 * fxRad * fxR.z; // pequeño arco de vuelo
+        vec3 fxOff = fxPos - fxO;
+        fxOff.xz = fxRot(fxSwirl * (1.0 - fxE) * (0.5 + fxR.w)) * fxOff.xz; // espiral que se cierra
+        fxPos = fxO + fxOff;
+
+        // Puntito -> splat real
+        vec3  fxS = ${inputs.gsplat}.scales;
+        float fxSmax = max(fxS.x, max(fxS.y, fxS.z));
+        float fxDotS = min(fxDot * (0.6 + 0.8 * fxR.w), fxSmax);
+        fxS = mix(vec3(fxDotS), fxS, smoothstep(0.45, 1.0, fxE));
+
+        vec4 fxCol = ${inputs.gsplat}.rgba;
+        fxCol.rgb = mix(fxCol.rgb, ${inputs.tint}.rgb, ${inputs.tint}.a * (1.0 - smoothstep(0.35, 1.0, fxE)));
+        fxCol.a *= smoothstep(0.0, 0.12, fxLt);
+
+        ${outputs.gsplat}.center = fxPos;
+        ${outputs.gsplat}.scales = fxS;
+        ${outputs.gsplat}.rgba = fxCol;
+        // Splats aún no "nacidos" o ya disueltos: fuera del pipeline (no se ordenan ni rasterizan)
+        if (fxCol.a < 0.004) ${outputs.gsplat}.flags = 0u;
+      }
+    `;
+    // FX_STATEMENTS>>
+
+    function createEffectModifier() {
+      return dyno.dynoBlock(
+        { gsplat: dyno.Gsplat },
+        { gsplat: dyno.Gsplat },
+        ({ gsplat }) => {
+          const fx = new dyno.Dyno({
+            inTypes: { gsplat: dyno.Gsplat, p: "float", dir: "float", origin: "vec3", shape: "vec4", motion: "vec4", tint: "vec4" },
+            outTypes: { gsplat: dyno.Gsplat },
+            globals: () => [dyno.unindent(FX_GLOBALS)],
+            statements: (io) => dyno.unindentLines(fxStatements(io)),
+          });
+          return { gsplat: fx.apply({ gsplat, p: uP, dir: uDir, origin: uOrigin, shape: uShape, motion: uMotion, tint: uTint }).gsplat };
+        }
+      );
+    }
+    const effectModifier = createEffectModifier(); // se comparte entre cues: se compila una sola vez
+
+    // ===================================================================
+    // CICLO DE VIDA DE CADA SPLAT (carga diferida, precarga, liberación)
+    // ===================================================================
+    const tintColor = new THREE.Color();
+    let objRadius = 1; // radio del objeto activo (para escalar parámetros relativos)
+
+    function syncUniforms() {
+      tintColor.set(params.tint);
+      uTint.value.set(tintColor.r, tintColor.g, tintColor.b, params.tintAmount);
+      uMotion.value.set(params.swirl, params.stagger, params.waveMix, params.dotSize * objRadius);
+      uShape.value.x = params.spread * objRadius;
+    }
+
+    function preload(cue) {
+      if (cue.mesh) return;
+      const opts = { url: cue.url, objectModifier: effectModifier };
+      if (cue.paged) opts.paged = true;
+      if (cue.lod) opts.lod = cue.lod;
+      const mesh = new SplatMesh(opts);
+      if (cue.flip) mesh.quaternion.set(1, 0, 0, 0);
+      mesh.position.set(...cue.position);
+      mesh.scale.setScalar(cue.scale);
+      mesh.visible = !!cue.paged;
+      scene.add(mesh);
+      cue.mesh = mesh;
+      cue.ready = mesh.initialized.then(() => {
+        let box = null;
+        try { box = mesh.getBoundingBox(true); } catch { }
+        const c = new THREE.Vector3(), sz = new THREE.Vector3(1, 1, 1);
+        if (box && !box.isEmpty()) { box.getCenter(c); box.getSize(sz); }
+        cue.objRadius = Math.max(sz.length() / 2, 1e-3);
+        cue.origin = c;
+        cue.box = new THREE.Box3().setFromCenterAndSize(c, sz);
+        const up = cue.flip ? -1 : 1;
+        cue.shape = { minUp: up > 0 ? (box ? box.min.y : 0) : -(box ? box.max.y : 0), height: sz.y, up };
+        mesh.updateMatrixWorld(true);
+        cue.worldCenter = mesh.localToWorld(c.clone());
+        return mesh;
+      });
+    }
+
+    function resetRotation(cue) {
+      if (cue.flip) cue.mesh.quaternion.set(1, 0, 0, 0); else cue.mesh.quaternion.set(0, 0, 0, 1);
+    }
+    // Modo pantalla normal: posición/escala originales del objeto (la cámara se coloca luego con teleportTop)
+    function placeFlat(cue) {
+      const m = cue.mesh;
+      resetRotation(cue);
+      m.position.set(...cue.position);
+      m.scale.setScalar(cue.scale);
+      m.updateMatrixWorld(true);
+      cue.worldCenter = m.localToWorld(cue.origin.clone());
+    }
+
+    // --- Pose guardada antes del splat (para volver al terminar) ---
+    let poseSaved = null;
+    function savePose() {
+      poseSaved = {
+        rigPos: userRig.position.clone(), rigYaw: userRig.rotation.y,
+        camPos: camera.position.clone(), yaw: fly.yaw, pitch: fly.pitch,
+      };
+    }
+    function restorePose() {
+      const sp = poseSaved; poseSaved = null;
+      fly.vel.set(0, 0, 0); vrVel.set(0, 0, 0);
+      if (!sp) return;
+      if (renderer.xr.isPresenting) {
+        userRig.position.copy(sp.rigPos); userRig.rotation.set(0, sp.rigYaw, 0);
+      } else {
+        userRig.position.set(0, 0, 0); userRig.rotation.set(0, 0, 0);
+        camera.position.copy(sp.camPos); setLook(sp.yaw, sp.pitch);
+      }
+    }
+
+    // --- Vista cenital: te coloca encima del splat mirando hacia él ---
+    const _tbox = new THREE.Box3(), _tEye = new THREE.Vector3(), _tDir = new THREE.Vector3(), _tHead = new THREE.Vector3();
+    function teleportTop(cue) {
+      const m = cue.mesh;
+      m.updateMatrixWorld(true);
+      const c = cue.worldCenter;
+      const R = Math.max(cue.objRadius * m.scale.x, 1e-3);      // radio en unidades de mundo
+      _tbox.copy(cue.box).applyMatrix4(m.matrixWorld);           // caja del splat ya en el mundo (respeta el flip)
+      _tEye.set(c.x, _tbox.max.y + R * TOP_VIEW.above, c.z + R * TOP_VIEW.back);
+      _tDir.copy(c).sub(_tEye);
+      const yaw = Math.atan2(-_tDir.x, -_tDir.z);
+      const pitch = Math.atan2(_tDir.y, Math.hypot(_tDir.x, _tDir.z));
+      if (renderer.xr.isPresenting) {                            // VR: se mueve el rig; la inclinación la pone tu cabeza
+        userRig.rotation.set(0, yaw, 0);
+        userRig.updateMatrixWorld(true);
+        _tHead.copy(camera.position).applyQuaternion(userRig.quaternion); // posición de la cabeza dentro del rig
+        userRig.position.copy(_tEye).sub(_tHead);
+      } else {                                                   // escritorio: se mueve la cámara
+        userRig.position.set(0, 0, 0); userRig.rotation.set(0, 0, 0);
+        camera.position.copy(_tEye);
+        setLook(yaw, pitch);
+      }
+      fly.vel.set(0, 0, 0); vrVel.set(0, 0, 0);
+    }
+    function goTop() { if (cueBusy()) teleportTop(active); }
+
+    // Modo VR: el objeto se reduce a tamaño de sala y se coloca delante del usuario
+    function placeForVR(cue) {
+      const m = cue.mesh;
+      resetRotation(cue);
+      m.scale.setScalar(VR_OBJECT.radius / cue.objRadius);
+      m.position.set(0, 0, 0);
+      m.updateMatrixWorld(true);
+      const wc = m.localToWorld(cue.origin.clone());
+      m.position.set(0, VR_OBJECT.y, -VR_OBJECT.distance).sub(wc);
+      m.updateMatrixWorld(true);
+      cue.worldCenter = m.localToWorld(cue.origin.clone());
+    }
+
+    function releaseCue(cue) {
+      if (!cue.mesh) return;
+      cue.mesh.visible = false;
+      if (!cue.keep) {
+        scene.remove(cue.mesh);
+        cue.mesh.dispose?.();
+        cue.mesh = null;
+        cue.ready = null;
+      }
+    }
+
+    // ===================================================================
+    // MÁQUINA DE ESTADOS
+    // playing -> loading -> intro -> hold -> outro -> playing
+    // ===================================================================
+    let state = "idle";
+    let active = null;
+    let p = 0, holdT = 0, dirty = false, prevT = 0, dim = 1;
+
+    const el = {
+      status: document.getElementById("status"),
+      seek: document.getElementById("seek"),
+      time: document.getElementById("time"),
+      btnPlay: document.getElementById("btnPlay"),
+      btnContinue: document.getElementById("btnContinue"),
+      btnTop: document.getElementById("btnTop"),
+      btnSplat: document.getElementById("btnSplat"),
+      start: document.getElementById("start"),
+    };
+
+    function setP(v) {
+      p = v; uP.value = v;
+      active?.mesh?.updateVersion(); // fuerza a Spark a regenerar los splats
+    }
+
+    async function startCue(cue) {
+      state = "loading";
+      active = cue;
+      video.pause();
+      setVideoCap(LOADING_VIDEO_CAP);
+      preload(cue);
+      try {
+        await cue.ready;
+      } catch (e) {
+        console.warn("Splat:", e);
+        cue.done = true; releaseCue(cue); active = null; state = "playing";
+        setVideoCap(MAX_VIDEO_HEIGHT); video.play().catch(() => { });
+        return;
+      }
+      if (active !== cue) return;
+
+      objRadius = cue.objRadius;
+      uOrigin.value.copy(cue.origin);
+      uShape.value.set(params.spread * objRadius, cue.shape.minUp, cue.shape.height, cue.shape.up);
+      syncUniforms();
+      uDir.value = 1;
+      p = 0; uP.value = 0;
+      cue.mesh.visible = true;
+      cue.mesh.updateVersion();
+
+      // Coloca el objeto y TELEPORTA al usuario arriba del splat (el fondo de vídeo va pegado a la cámara en 2D,
+      // y al terminar se restaura la pose anterior)
+      savePose();
+      if (renderer.xr.isPresenting) placeForVR(cue); else placeFlat(cue);
+      teleportTop(cue);
+      state = "intro";
+    }
+
+    function beginOutro() {
+      if (state !== "hold") return;
+      el.btnContinue.style.display = "none";
+      uDir.value = -1;
+      setP(1);
+      state = "outro";
+    }
+
+    function finishCue() {
+      const cue = active;
+      releaseCue(cue);
+      cue.done = true;
+      active = null;
+      state = "playing";
+      restorePose();
+      setVideoCap(MAX_VIDEO_HEIGHT);
+      prevT = video.currentTime;
+      video.play().catch(() => { });
+    }
+
+    // Repite el efecto sin tocar el vídeo (botón del GUI, útil para ajustar parámetros)
+    function replayEffect() {
+      if (state === "playing" || state === "idle") {
+        const cue = CUES[0];
+        cue.done = false;
+        startCue(cue);
+      } else if (state === "hold") {
+        beginOutro();
+      }
+    }
+
+    function updateState(dt) {
+      switch (state) {
+        case "playing": {
+          const t = video.currentTime;
+          for (const cue of CUES) {
+            if (cue.done) continue;
+            if (!cue.mesh && t >= cue.time - PRELOAD_LEAD && t < cue.time + 0.5) {
+              preload(cue);
+              setVideoCap(LOADING_VIDEO_CAP);
+            }
+            // Solo dispara al CRUZAR el instante del cue en reproducción normal (no al hacer seek más allá)
+            if (prevT < cue.time && t >= cue.time && t - prevT < 1.5) { startCue(cue); break; }
+          }
+          prevT = t;
+          break;
+        }
+        case "intro":
+          setP(Math.min(1, p + dt / params.introSec));
+          if (p >= 1) {
+            state = "hold"; holdT = 0;
+            el.btnContinue.style.display = "inline-block";
+          }
+          break;
+        case "hold":
+          if (dirty) { active.mesh.updateVersion(); dirty = false; } // solo regenera si se toca el GUI
+          if (active.hold > 0 && (holdT += dt) >= active.hold) beginOutro();
+          break;
+        case "outro":
+          setP(Math.max(0, p - dt / params.outroSec));
+          if (p <= 0) finishCue();
+          break;
+      }
+    }
+
+    // ===================================================================
+    // UI
+    // ===================================================================
+    const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+    async function startPlayback() {
+      if (!el.start.isConnected) return;
+      el.start.remove();
+      video.muted = false;
+      await video.play().catch(() => { video.muted = true; return video.play().catch(() => { }); });
+      state = "playing";
+      prevT = video.currentTime;
+    }
+    el.start.addEventListener("click", () => {
+      if (isInstalledPWA && xrSupported) enterVR(); // en la PWA, este toque también entra en VR (gesto de usuario)
+      startPlayback();
+    });
+    el.btnPlay.addEventListener("click", () => {
+      if (state !== "playing") return;
+      video.paused ? video.play() : video.pause();
+    });
+    el.btnContinue.addEventListener("click", beginOutro);
+    el.btnTop.addEventListener("click", goTop);
+    el.btnSplat.addEventListener("click", replayEffect); // lanza el splat a demanda (sin esperar al cue del vídeo)
+    addEventListener("keydown", (e) => {
+      if ((e.code === "Space" || e.code === "Enter") && state === "hold") beginOutro();
+      if (e.target instanceof HTMLInputElement) return; // no robar teclas al slider
+      if (e.code === "KeyT" && cueBusy()) goTop();
+      if (e.code === "KeyR") fly.keys.add("KeyE");      // alias de subir/bajar
+      else if (e.code === "KeyF") fly.keys.add("KeyQ");
+      else fly.keys.add(e.code);
+    });
+    addEventListener("keyup", (e) => { if (e.code === "KeyR") fly.keys.delete("KeyE"); if (e.code === "KeyF") fly.keys.delete("KeyQ"); });
+
+    el.seek.addEventListener("input", () => {
+      if (state !== "playing" || !isFinite(video.duration)) return;
+      video.currentTime = (el.seek.value / 1000) * video.duration;
+      prevT = video.currentTime;
+      // Si se vuelve atrás antes de un cue, se rearma
+      for (const cue of CUES) if (video.currentTime < cue.time - 0.05) cue.done = false;
+    });
+
+    // ===================================================================
+    // GUI
+    // ===================================================================
+    const gui = new GUI({ title: "Efecto splat" });
+    // --- Reproductor (solo se muestra dentro de VR, en el panel 3D) ---
+    const playerUI = gui.addFolder("Reproductor");
+    const ps = { time: 0 };
+    let lastUserSeek = 0;
+    const seekTo = (t) => {
+      if (state !== "playing" || !isFinite(video.duration)) return;
+      video.currentTime = THREE.MathUtils.clamp(t, 0, Math.max(0, video.duration - 0.1));
+      prevT = video.currentTime;
+      for (const cue of CUES) if (video.currentTime < cue.time - 0.05) cue.done = false; // rearma cues si se vuelve atrás
+    };
+    const togglePlay = () => { if (state === "playing") video.paused ? video.play() : video.pause(); };
+    playerUI.add({ f: togglePlay }, "f").name("Play / Pausa");
+    playerUI.add({ f: () => seekTo(video.currentTime - 10) }, "f").name("Atrasar 10 s");
+    playerUI.add({ f: () => seekTo(video.currentTime + 10) }, "f").name("Adelantar 10 s");
+    const timeCtrl = playerUI.add(ps, "time", 0, 100, 0.1).name("tiempo (s)")
+      .onChange((v) => { const n = performance.now(); lastUserSeek = n; if (n - (playerUI._lastSeek ?? 0) > 250) { playerUI._lastSeek = n; seekTo(v); } })
+      .onFinishChange((v) => { lastUserSeek = performance.now(); seekTo(v); });
+    playerUI.add({ f: beginOutro }, "f").name("Continuar vídeo");
+    playerUI.add({ f: () => replayEffect() }, "f").name("Mostrar splat");
+    playerUI.add({ f: () => goTop() }, "f").name("Vista cenital");
+    playerUI.add({ f: () => { userRig.position.set(0, 0, 0); userRig.rotation.set(0, 0, 0); } }, "f").name("Recentrar posición");
+    playerUI.hide();
+
+    const onFx = () => { syncUniforms(); dirty = true; };
+    const fx = gui.addFolder("Puntos → splat");
+    fx.add(params, "introSec", 0.5, 8, 0.1).name("duración entrada (s)");
+    fx.add(params, "outroSec", 0.5, 8, 0.1).name("duración salida (s)");
+    fx.add(params, "spread", 0.3, 5, 0.05).name("radio nube").onChange(onFx);
+    fx.add(params, "swirl", 0, 20, 0.1).name("espiral").onChange(onFx);
+    fx.add(params, "stagger", 0, 0.9, 0.01).name("escalonado").onChange(onFx);
+    fx.add(params, "waveMix", 0, 1, 0.01).name("onda abajo→arriba").onChange(onFx);
+    fx.add(params, "dotSize", 0.001, 0.06, 0.001).name("tamaño punto").onChange(onFx);
+    fx.add(params, "tintAmount", 0, 1, 0.01).name("tinte").onChange(onFx);
+    fx.addColor(params, "tint").name("color puntos").onChange(onFx);
+    fx.add(params, "videoDim", 0, 1, 0.01).name("brillo vídeo con splat");
+    fx.add({ replay: replayEffect }, "replay").name(" probar / salir del efecto");
+
+    const perf = gui.addFolder("Rendimiento");
+    const perfState = { lodSplatScale: spark.lodSplatScale ?? 1, maxStdDev: Math.sqrt(8) };
+    perf.add(perfState, "lodSplatScale", 0.1, 2.5, 0.01).name("LoD splats").onChange((v) => { spark.lodSplatScale = v; });
+    perf.add(perfState, "maxStdDev", 1.5, 4, 0.01).name("maxStdDev").onChange((v) => { spark.maxStdDev = v; });
+    perf.close();
+
+    const flyF = gui.addFolder("Vuelo");
+    flyF.add(FLY, "relSpeed", 0.05, 3, 0.05).name("velocidad (radios/s)");
+    flyF.add(FLY, "minSpeed", 0.2, 10, 0.1).name("velocidad mínima (m/s)");
+    flyF.add(FLY, "boost", 1, 8, 0.1).name("turbo ×");
+    flyF.add(FLY, "smooth", 1, 30, 0.5).name("respuesta / inercia");
+    flyF.add(TOP_VIEW, "above", 0, 3, 0.05).name("cenital: altura (×radio)").onFinishChange(goTop);
+    flyF.add(TOP_VIEW, "back", 0, 3, 0.05).name("cenital: retroceso (×radio)").onFinishChange(goTop);
+    flyF.add({ f: () => goTop() }, "f").name("⤒ ir a vista cenital");
+
+    // ===================================================================
+    // VR (WebXR)
+    // ===================================================================
+    let savedLod = 1;
+    const cueBusy = () => active?.mesh && (state === "intro" || state === "hold" || state === "outro");
+    const resetRig = () => { userRig.position.set(0, 0, 0); userRig.rotation.set(0, 0, 0); };
+
+    // Panel 3D: el GUI (lil-gui) dibujado en una textura, que se maneja apuntando con los mandos
+    const guiGroup = new InteractiveGroup();
+    scene.add(guiGroup);
+    let guiMesh = null;
+
+    renderer.xr.addEventListener("sessionstart", () => {
+      resetRig();
+      if (poseSaved) { poseSaved.rigPos.set(0, 0, 0); poseSaved.rigYaw = 0; }
+      camera.remove(videoPlane);            // la pantalla deja de seguir a la cabeza
+      scene.add(videoPlane);
+      videoPlane.position.set(0, VR_SCREEN.y, -VR_SCREEN.distance);
+      fitVideoPlane();
+      savedLod = spark.lodSplatScale ?? 1;
+      spark.lodSplatScale = VR_LOD_SCALE;
+      if (cueBusy()) { placeForVR(active); teleportTop(active); }
+      hudGroup.visible = true; hudKey = ""; anchorHud(true);
+
+      playerUI.show(); fx.hide(); perf.hide(); flyF.hide(); // en VR solo el reproductor
+      guiMesh = new HTMLMesh(gui.domElement);
+      guiMesh.scale.setScalar(2.4);            // ajusta si se ve grande o pequeño
+      guiMesh.position.set(-0.85, 1.25, -1.1); // a la izquierda, delante
+      guiMesh.rotation.y = Math.atan2(0.85, 1.1); // mirando hacia el usuario
+      guiGroup.add(guiMesh);
+
+      startPlayback();                      // el clic en "Enter VR" cuenta como gesto del usuario
+    });
+
+    renderer.xr.addEventListener("sessionend", () => {
+      if (guiMesh) { guiGroup.remove(guiMesh); guiMesh.dispose?.(); guiMesh = null; }
+      playerUI.hide(); fx.show(); perf.show(); flyF.show();
+      hudGroup.visible = false;
+      resetRig();
+      scene.remove(videoPlane);
+      camera.add(videoPlane);
+      videoPlane.position.set(0, 0, -VIDEO_DIST);
+      spark.lodSplatScale = savedLod;
+      renderer.setSize(innerWidth, innerHeight);
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      fitVideoPlane();
+      if (cueBusy()) { placeFlat(active); teleportTop(active); }
+      else { camera.position.set(0, 0.5, 3.5); setLook(0, 0); }
+    });
+
+    // ===================================================================
+    // HUD 3D (barra de controles de video-screen.js): -10 s · play/pausa · +10 s · progreso
+    // Flota delante del pecho, cuelga del rig (te sigue al volar) y solo se ve en VR.
+    // Con el splat formado la zona de progreso cambia a [Vista cenital] [Continuar ▸].
+    // ===================================================================
+    const HUD = { width: 1.3, dist: 0.8, drop: 0.5, tilt: 0.55 };
+    const CW = 1024, CH = 128, SKIP = 10, BAR_X0 = 570, BTN_X0 = 400, BAR_X1 = CW - 40;
+    const hudCv = document.createElement("canvas");
+    hudCv.width = CW; hudCv.height = CH;
+    const hudCx = hudCv.getContext("2d");
+    const hudTex = new THREE.CanvasTexture(hudCv);
+    hudTex.colorSpace = THREE.SRGBColorSpace;
+    hudTex.generateMipmaps = false;
+    hudTex.minFilter = THREE.LinearFilter;
+
+    const hudGroup = new THREE.Group();
+    hudGroup.rotation.order = "YXZ";
+    hudGroup.visible = false;
+    userRig.add(hudGroup);
+    const hudBar = new THREE.Mesh(
+      new THREE.PlaneGeometry(HUD.width, HUD.width * CH / CW),
+      new THREE.MeshBasicMaterial({ map: hudTex, toneMapped: false, side: THREE.DoubleSide })
+    );
+    hudBar.rotation.x = -HUD.tilt; // inclinada hacia los ojos
+    hudGroup.add(hudBar);
+
+    const hudTri = (x, y, sz, dir) => {
+      hudCx.beginPath();
+      hudCx.moveTo(x, y - sz); hudCx.lineTo(x, y + sz); hudCx.lineTo(x + dir * sz * 1.4, y);
+      hudCx.fill();
+    };
+    function drawHud() {
+      const c = hudCx;
+      c.fillStyle = "#141414"; c.fillRect(0, 0, CW, CH);
+      c.fillStyle = "#fff";
+      hudTri(70, 64, 22, -1); hudTri(96, 64, 22, -1);                                    // -10 s
+      if (video.paused) { c.beginPath(); c.moveTo(170, 30); c.lineTo(170, 98); c.lineTo(226, 64); c.fill(); } // play
+      else { c.fillRect(172, 30, 18, 68); c.fillRect(204, 30, 18, 68); }                 // pausa
+      hudTri(300, 64, 22, 1); hudTri(326, 64, 22, 1);                                    // +10 s
+      if (state === "hold") {
+        c.font = "600 30px system-ui, sans-serif"; c.textAlign = "center"; c.textBaseline = "middle";
+        c.fillStyle = "#333"; c.fillRect(BTN_X0, 24, 250, 80);
+        c.fillStyle = "#fff"; c.fillText("Vista cenital", BTN_X0 + 125, 66);
+        c.fillStyle = "#cafefe"; c.fillRect(670, 24, BAR_X1 - 670, 80);
+        c.fillStyle = "#000"; c.fillText("Continuar \u25B8", 670 + (BAR_X1 - 670) / 2, 66);
+      } else {
+        // Botón para lanzar el splat a demanda
+        const busy = state === "loading";
+        c.font = "600 28px system-ui, sans-serif"; c.textAlign = "center"; c.textBaseline = "middle";
+        c.fillStyle = busy ? "#333" : "#cafefe"; c.fillRect(BTN_X0, 24, 150, 80);
+        c.fillStyle = busy ? "#aaa" : "#000"; c.fillText(busy ? "Cargando" : "Splat", BTN_X0 + 75, 66);
+        const dur = isFinite(video.duration) ? video.duration : 0;
+        const pr = dur > 0 ? THREE.MathUtils.clamp(video.currentTime / dur, 0, 1) : 0;
+        c.fillStyle = "#555"; c.fillRect(BAR_X0, 58, BAR_X1 - BAR_X0, 12);
+        c.fillStyle = "#cafefe"; c.fillRect(BAR_X0, 58, (BAR_X1 - BAR_X0) * pr, 12);
+      }
+      hudTex.needsUpdate = true;
+    }
+    drawHud();
+
+    // La barra sigue a la cabeza (posición siempre; giro solo si te giras mucho, para que no se mueva a cada mirada)
+    let hudYaw = 0, hudKey = "";
+    const _hd = new THREE.Vector3();
+    function anchorHud(snap) {
+      _hd.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      if (Math.hypot(_hd.x, _hd.z) > 0.3) {
+        const headYaw = Math.atan2(-_hd.x, -_hd.z);
+        const diff = Math.atan2(Math.sin(headYaw - hudYaw), Math.cos(headYaw - hudYaw));
+        if (snap) hudYaw = headYaw; else if (Math.abs(diff) > 0.9) hudYaw += diff * 0.08;
+      }
+      hudGroup.rotation.set(0, hudYaw, 0);
+      hudGroup.position.set(
+        camera.position.x - Math.sin(hudYaw) * HUD.dist,
+        camera.position.y - HUD.drop,
+        camera.position.z - Math.cos(hudYaw) * HUD.dist
+      );
+    }
+    function updateHud() {
+      anchorHud(false);
+      const k = `${state}|${video.paused}|${video.currentTime | 0}`;
+      if (k !== hudKey) { hudKey = k; drawHud(); }
+    }
+
+    const hudRay = new THREE.Raycaster();
+    const _ro = new THREE.Vector3(), _rd = new THREE.Vector3(), _rm = new THREE.Matrix4();
+    function onHudSelect(ctrl) {
+      if (!hudGroup.visible) return;
+      _rm.identity().extractRotation(ctrl.matrixWorld);
+      _ro.setFromMatrixPosition(ctrl.matrixWorld);
+      _rd.set(0, 0, -1).applyMatrix4(_rm);
+      hudRay.set(_ro, _rd);
+      const hit = hudRay.intersectObject(hudBar)[0];
+      if (!hit) return;
+      const px = hit.uv.x * CW;
+      video.muted = false;
+      if (px < 130) seekTo(video.currentTime - SKIP);
+      else if (px < 260) togglePlay();
+      else if (px < 380) seekTo(video.currentTime + SKIP);
+      else if (state === "hold") { if (px < 660) goTop(); else beginOutro(); }
+      else if (px < BAR_X0 - 10) { if (state === "playing" || state === "idle") replayEffect(); } // botón Splat
+      else if (isFinite(video.duration)) seekTo(THREE.MathUtils.clamp((px - BAR_X0) / (BAR_X1 - BAR_X0), 0, 1) * video.duration);
+      hudKey = ""; // fuerza redibujado
+    }
+
+    // Mandos: los controladores cuelgan del rig (así se mueven con la locomoción) y llevan un rayo visible
+    const controllers = [];
+    function onVRShortcut() { // botón de agarre (grip): continuar / play-pausa, sin apuntar al panel
+      if (state === "hold") beginOutro(); else togglePlay();
+    }
+    for (let i = 0; i < 2; i++) {
+      const c = renderer.xr.getController(i);
+      const ray = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]),
+        new THREE.LineBasicMaterial({ color: 0xcafefe })
+      );
+      ray.scale.z = 3;
+      c.add(ray);
+      c.addEventListener("squeezestart", onVRShortcut);
+      c.addEventListener("selectstart", () => onHudSelect(c)); // apuntar + gatillo sobre la barra 3D
+      userRig.add(c);
+      guiGroup.listenToXRControllerEvents(c);
+      controllers.push(c);
+    }
+
+    // Locomoción con sticks (Quest: axes[2], axes[3] = thumbstick)
+    // Con splat en escena: VUELO LIBRE relativo a la cámara (avanzas hacia donde miras, también arriba/abajo).
+    // Sin splat: caminar en plano como antes.
+    const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _head = new THREE.Vector3();
+    const _up = new THREE.Vector3(0, 1, 0);
+    const _tgt = new THREE.Vector3(), vrVel = new THREE.Vector3();
+    let snapArmed = true;
+    const dz = (v) => (Math.abs(v) < LOCOMOTION.deadZone ? 0 : v);
+
+    function rotateRigAroundHead(angle) { // gira en el sitio (la cabeza no se desplaza)
+      camera.getWorldPosition(_head);
+      userRig.position.sub(_head).applyAxisAngle(_up, angle).add(_head);
+      userRig.rotateY(angle);
+    }
+
+    // Velocidad de vuelo proporcional al tamaño del splat (en unidades de mundo)
+    function flySpeed() {
+      const R = active?.mesh ? active.objRadius * active.mesh.scale.x : 1;
+      return THREE.MathUtils.clamp(R * FLY.relSpeed, FLY.minSpeed, FLY.maxSpeed);
+    }
+
+    function updateVRLocomotion(dt) {
+      if (!LOCOMOTION.enabled) return;
+      const session = renderer.xr.getSession();
+      if (!session) return;
+      const flying = cueBusy();
+      let boost = 1;
+      _tgt.set(0, 0, 0);
+      for (const src of session.inputSources) {
+        const ax = src.gamepad?.axes;
+        if (!ax || ax.length < 2) continue;
+        const i = ax.length >= 4 ? 2 : 0;
+        const x = dz(ax[i]), y = dz(ax[i + 1]);
+        if (src.handedness === "left") {
+          if (flying && src.gamepad.buttons[3]?.pressed) boost = FLY.boost; // clic del stick = turbo
+          if (!x && !y) continue;
+          camera.getWorldDirection(_fwd);
+          if (!flying) _fwd.y = 0;                    // vuelo: dirección 3D completa de la cámara
+          if (_fwd.lengthSq() < 1e-6) continue;
+          _fwd.normalize();
+          _right.crossVectors(_fwd, _up).normalize();
+          _tgt.addScaledVector(_fwd, -y).addScaledVector(_right, x);
+        } else if (src.handedness === "right") {
+          if (LOCOMOTION.snapTurn) {
+            if (Math.abs(x) > 0.6 && snapArmed) {
+              rotateRigAroundHead((x > 0 ? -1 : 1) * THREE.MathUtils.degToRad(LOCOMOTION.snapAngleDeg));
+              snapArmed = false;
+            } else if (Math.abs(x) < 0.3) snapArmed = true;
+          } else if (x) rotateRigAroundHead(-x * dt * 1.5);
+          if (flying && y) _tgt.y += -y;              // stick derecho arriba = subir
+        }
+      }
+      if (_tgt.lengthSq() > 1) _tgt.normalize();
+      _tgt.multiplyScalar(flying ? flySpeed() * boost : LOCOMOTION.speed);
+      vrVel.lerp(_tgt, 1 - Math.exp(-FLY.smooth * dt)); // inercia suave (más cómodo en VR)
+      if (vrVel.lengthSq() > 1e-8) userRig.position.addScaledVector(vrVel, dt);
+    }
+
+    // Vuelo en escritorio: WASD relativo a la cámara (con inclinación), E/Q subir/bajar, Shift turbo
+    function updateDesktopFly(dt) {
+      if (!cueBusy()) { fly.vel.set(0, 0, 0); return; }
+      const k = fly.keys;
+      const f = (k.has("KeyW") ? 1 : 0) - (k.has("KeyS") ? 1 : 0);
+      const r = (k.has("KeyD") ? 1 : 0) - (k.has("KeyA") ? 1 : 0);
+      const u = (k.has("KeyE") ? 1 : 0) - (k.has("KeyQ") ? 1 : 0);
+      camera.getWorldDirection(_fwd);
+      _right.crossVectors(_fwd, _up).normalize();
+      _tgt.set(0, 0, 0).addScaledVector(_fwd, f).addScaledVector(_right, r).addScaledVector(_up, u);
+      if (_tgt.lengthSq() > 1) _tgt.normalize();
+      const turbo = k.has("ShiftLeft") || k.has("ShiftRight") ? FLY.boost : 1;
+      _tgt.multiplyScalar(flySpeed() * fly.mult * turbo);
+      fly.vel.lerp(_tgt, 1 - Math.exp(-FLY.smooth * dt));
+      if (fly.vel.lengthSq() > 1e-8) camera.position.addScaledVector(fly.vel, dt);
+    }
+
+    // Mantiene la barra de tiempo del panel al día (sin redibujar cada frame)
+    let lastPanelT = 0, lastDur = 0;
+    function updateVRPanel() {
+      const now = performance.now();
+      if (now - lastPanelT < 300 || now - lastUserSeek < 800) return;
+      lastPanelT = now;
+      if (isFinite(video.duration) && video.duration > 0) {
+        if (video.duration !== lastDur) { lastDur = video.duration; timeCtrl.max(lastDur); }
+        ps.time = video.currentTime;
+        timeCtrl.updateDisplay();
+      }
+    }
+
+    // ===================================================================
+    // BUCLE
+    // ===================================================================
+    const clock = new THREE.Clock();
+    let fpsAcc = 0, fpsN = 0, fps = 0;
+    renderer.setAnimationLoop(() => {
+      const dt = Math.min(clock.getDelta(), 0.1);
+      updateState(dt);
+
+      // Atenúa el vídeo mientras el splat está en escena
+      const target = state === "playing" || state === "idle" ? 1 : params.videoDim;
+      dim += (target - dim) * Math.min(1, dt * 4);
+      videoMat.color.setScalar(dim);
+
+      if (renderer.xr.isPresenting) {
+        updateVRLocomotion(dt);
+        for (const c of controllers) c.dispatchEvent({ type: "move" }); // hover/arrastre sobre el panel
+        updateVRPanel();
+        updateHud();
+      } else updateDesktopFly(dt);
+      renderer.render(scene, camera);
+
+      // HUD
+      if (isFinite(video.duration) && video.duration > 0 && document.activeElement !== el.seek) {
+        el.seek.value = (video.currentTime / video.duration) * 1000;
+      }
+      el.seek.disabled = state !== "playing";
+      const splatVisible = state === "playing";
+      if (el.btnSplat.dataset.v !== String(splatVisible)) { el.btnSplat.dataset.v = String(splatVisible); el.btnSplat.style.display = splatVisible ? "inline-block" : "none"; }
+      const topVisible = state === "intro" || state === "hold";
+      if (el.btnTop.dataset.v !== String(topVisible)) { el.btnTop.dataset.v = String(topVisible); el.btnTop.style.display = topVisible ? "inline-block" : "none"; }
+      el.time.textContent = `${fmt(video.currentTime)} / ${fmt(video.duration || 0)}`;
+      fpsAcc += dt; fpsN++;
+      if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+      el.status.textContent =
+        `estado: ${state}${state === "loading" ? " (cargando splat…)" : ""}\n` +
+        `fps: ${fps.toFixed(0)}  splats activos: ${typeof spark.activeSplats === "number" ? spark.activeSplats : "-"}\n` +
+        `p: ${p.toFixed(2)}` +
+        (cueBusy() && !renderer.xr.isPresenting
+          ? `\nWASD volar · E/Q subir/bajar · Shift turbo\narrastrar = mirar · rueda = velocidad · T = cenital`
+          : "");
+    });
+
+    initVideo().catch((e) => console.warn("Vídeo:", e));
+
+    // ===================================================================
+    // PWA: service worker + entrada directa en VR al abrir la app instalada
+    // ===================================================================
+    if ("serviceWorker" in navigator && isSecureContext) {
+      navigator.serviceWorker.register("./sw-vr.js").catch((e) => console.warn("SW:", e));
+    }
+    (async () => {
+      await xrChecked;
+      if (!isInstalledPWA || !xrSupported) return;
+      // Meta: en una PWA WebXR se llama a requestSession justo tras cargar; pulsar el icono cuenta como gesto.
+      if (document.readyState !== "complete") await new Promise((r) => addEventListener("load", r, { once: true }));
+      const ok = await enterVR();
+      if (!ok) el.start.textContent = " Pulsa para entrar en VR"; // si el navegador exige gesto, el toque en pantalla lo hace
+    })();
+  </script>
+</body>
+
+</html>
